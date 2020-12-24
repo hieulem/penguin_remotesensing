@@ -1,0 +1,419 @@
+"""
+Wrapper for Segmentation Evaluation. 
+Author: Hieu Le
+License: MIT
+Copyright: 2018-2019
+"""
+import sys
+sys.path.insert(0, "./..")
+import torch
+import os.path
+import argparse
+from scipy import misc
+from models import create_model
+from data.png_dataset import PngDataset
+from options.train_options import TrainOptions
+from options.test_options import TestOptions
+from data import CreateDataLoader
+from data_processing.m_im_util import *
+#from util.misc import crf_refine 
+from data_processing.im_vis import *
+import time
+import numpy as np
+from sklearn.metrics import average_precision_score as ap_score
+from sklearn.metrics import jaccard_similarity_score as iou_score
+import re
+_to_esc = re.compile(r'\s|[]()[]')
+def _esc_char(match):
+    return '\\' + match.group(0)
+def my_escape(name):
+    return _to_esc.sub(_esc_char, name)
+class Pipe:
+    def __init__(self,opt):
+        self.opt = opt
+        self.opt.step = 128
+        self.opt.size = 256
+        self.m_name = opt.name
+        self.epoch = opt.epoch
+        self.import_model()
+        self.output = opt.output +'/' + self.m_name+'/' + str(self.opt.which_epoch) + '/' +opt.testset +'/'
+        #self.out_eval = os.path.join(self.output,'eval')
+        self.out_raw = os.path.join(self.output,'raw')
+        self.out_vis = os.path.join(self.output,'vis')
+        sdmkdir(self.output)
+        sdmkdir(self.output+'raw')
+        sdmkdir(self.output+'vis')
+        sdmkdir(self.output+'tmp')
+        sdmkdir(self.output+'all')
+        self.input =  input
+    def import_model(self):
+        opt.name = self.m_name
+        if 'unetr' in opt.name:
+            opt.model='unetr'
+        elif 'unetprior' in opt.name:
+            opt.model='unetprior'
+            opt.inject_depth = int(re.search(r'idepth\d+',opt.name).group(0)[-1])
+            opt.prior_depth = int(re.search(r'pdepth\d+',opt.name).group(0)[-1])
+            opt.prior_nf = int(re.search(r'pnf\d+',opt.name).group(0)[3:])
+
+        elif 'unet' in opt.name:
+            opt.model = 'unet'
+        opt.which_epoch=self.epoch
+        opt.serial_batches = True  # no shuffle
+        opt.no_flip = True  # no flip
+        opt.no_dropout = True
+        #opt.checkpoints_dir ='/nfs/biglens/add_disk0/hieule/checkpoints_RS2020/'
+        
+        opt.gpu_ids = [2]
+        print(opt)
+        self.network = create_model(opt)
+        self.network.eval()
+        self.opt = opt 
+    def list_tif_predict(self,file):
+        import rasterio
+        from data_processing.tif_handle import TIF_H
+        root = '/gpfs/projects/LynchGroup/Orthoed/'
+        imlist =[]
+        imnamelist =[]
+        f = open(file,'r')
+        while True:
+            line = f.readline()
+            if not line:break
+            imnamelist.append(line.split()[0] ) 
+        print(imnamelist)
+
+        for name in imnamelist :
+            self.tif_predict(root+name)
+    def dir_tif_predict(self,fold):
+        imlist =[]
+        imnamelist =[]
+        for root,_,fnames in sorted(os.walk(fold)):
+            for fname in fnames:
+                if fname.endswith('.tif') and 'M1BS' in fname:
+                    path = os.path.join(root,fname)
+                    imlist.append(path)
+                    imnamelist.append(fname)
+        print(imnamelist)
+        for name in imlist :
+            try:
+                self.tif_predict(name)
+            except:
+                print('failed')
+    def tif_predict(self,file):
+        try:    
+            print(file)
+            basename = os.path.basename(file)
+            if not os.path.isfile(self.output+'/'+basename):
+                tif = TIF_H(file)
+                tif.get_png()
+                outpng = self.png_predict(tif.png)
+                print(outpng) 
+                tif.profile.update(dtype=rasterio.uint8, count=1)
+                with rasterio.open(self.output+'/'+basename, 'w', **tif.profile) as dst:
+                        dst.write(outpng.astype(rasterio.uint8), 1)
+        except:
+            print("failed")
+
+    def dir_png_predict_with_prior(self,fold,prior_fold,names=[]):
+        self.input = fold
+        self.input_prior=prior_fold
+        imlist =[]
+        imnamelist =[]
+        for root,_,fnames in sorted(os.walk(fold)):
+            for fname in fnames:
+                if fname.endswith('.png') and 'M1BS' in fname and not fname.startswith('.'):
+                    if len(names)==0:
+                        path = os.path.join(root,fname)
+                        path2 = os.path.join(prior_fold,fname)
+                        imlist.append((path,path2,fname))
+                        imnamelist.append(fname)
+                    else:
+                        for name in names:
+                            if "_"+name+"_" in fname:
+                                path = os.path.join(root,fname)
+                                path2 = os.path.join(prior_fold,fname)
+                                imlist.append((path,path2,fname))
+                                imnamelist.append(fname)
+                                break
+
+        imlist.sort()
+        for path,prior_path,name in imlist :
+            print(path)
+            try:
+                inpng = misc.imread(path)
+                if inpng.shape[0] * inpng.shape[1] // 128 //128 > 2000: continue
+                prior = misc.imread(prior_path)
+                if len(prior.shape) ==2:
+                    prior = np.expand_dims(prior,axis=2)
+                outpng = self.png_predict_with_prior(inpng,prior)
+                out_vis = show_plainmask_on_image(inpng,outpng)
+                prior_vis = show_plainmask_on_image(inpng,prior[:,:,0])
+                misc.imsave(self.output+'/raw/'+name,outpng)
+                misc.imsave(self.output+'/vis/'+name,out_vis)
+                #print(inpng.shape,outpng.shape,out_vis.shape,prior_vis.shape)
+                misc.imsave(self.output+'/all/'+name,np.hstack([inpng,out_vis,prior_vis]))
+            except:
+                print('failed')
+
+    def png_predict_with_prior(self,im,prior):
+        last = time.time()
+        opt.step = self.opt.step#128
+        opt.size = self.opt.size#256
+        w,h,c = im.shape
+        ow,oh,oc = im.shape
+        if ow<256 or oh<256:
+            temp = np.zeros((max(256,ow),max(256,oh),3))
+            temp[:ow,:oh,:] = im
+            im = temp
+            temp2 = np.zeros((max(256,ow),max(256,oh),1))
+            temp2[:ow,:oh,:] = prior
+            prior = temp2
+
+
+        w,h,c = im.shape
+        patches = png2patches(im,opt.step,opt.size)
+        prior_patches = png2patches(prior,opt.step,opt.size)
+
+        print(patches.shape,prior_patches.shape)
+        elapsed_time = time.time() - last
+        last = time.time()
+        print('im 2 patches: %0.4f'%(elapsed_time))
+
+        orishape = np.asarray(patches.shape)
+        orishape[-1] = 1
+
+        patches = np.reshape(patches, (-1,256,256,3))
+        prior_patches = np.reshape(prior_patches, (-1,256,256,1))
+        outshape  = np.asarray(patches.shape)
+        outshape[3] = 1
+        patches = np.transpose(patches,(0,3,1,2))
+        prior_patches = np.transpose(prior_patches,(0,3,1,2))
+        s = np.asarray(patches.shape)
+        s[1] = 1
+        bs = 32
+        n_patches = patches.shape[0]
+        out = np.zeros(s) 
+        print('numbers of patches %d'%(n_patches))
+        print('Processing all patches')
+        for i in range(0,n_patches,bs):
+            batch  = patches[i:i+bs,:,:,:]
+            prior_batch = prior_patches[i:i+bs,:,:,:]
+            batch = torch.from_numpy(batch).float().div(255)
+            batch = (batch  - 0.5) * 2
+
+            prior_batch = torch.from_numpy(prior_batch).float().div(255)
+            prior_batch[prior_batch>0] = 1
+            prior_batch[prior_batch!=1] = 0
+            prior_batch = (prior_batch  - 0.5) * 2
+            temp = self.network.get_prediction_tensor(batch,prior_batch)
+            out[i:i+bs,:,:,:] = temp['raw_out']
+
+        elapsed_time = time.time() - last
+        last = time.time()
+        print('patches 2 prediction: %0.4f'%(elapsed_time))
+        out = np.reshape(out,outshape)
+        out = np.reshape(out,(orishape[0],orishape[1],outshape[3],outshape[1],outshape[2]))
+
+        outpng = patches2png_legacy(out,w,h,opt.step,opt.size)
+        print('merging')
+        outpng = np.transpose(outpng,(1,2,0))
+        outpng = np.squeeze(outpng) 
+        outpng = (outpng + 1)/2
+        out = outpng
+        outpng = outpng*255
+        if ow!=w or oh!=h:
+            outpng = outpng[:ow,:oh]
+        return outpng
+    def png_predict(self,im):
+        last = time.time()
+        opt.step = self.opt.step#128
+        opt.size = self.opt.size#256
+        ow,oh,oc = im.shape
+        if ow<256 or oh<256:
+            temp = np.zeros((max(256,ow),max(256,oh),3))
+            temp[:ow,:oh,:] = im
+            im = temp
+
+        w,h,c = im.shape
+        patches = png2patches(im,opt.step,opt.size)
+        print(patches.shape)
+        elapsed_time = time.time() - last
+        last = time.time()
+        print('im 2 patches: %0.4f'%(elapsed_time))
+
+        orishape = np.asarray(patches.shape)
+        orishape[-1] = 1
+
+        patches = np.reshape(patches, (-1,256,256,3))
+        outshape  = np.asarray(patches.shape)
+        outshape[3] = 1
+        patches = np.transpose(patches,(0,3,1,2))
+        s = np.asarray(patches.shape)
+        s[1] = 1
+        bs = 32
+        n_patches = patches.shape[0]
+        out = np.zeros(s) 
+        print('numbers of patches %d'%(n_patches))
+        print('Processing all patches')
+        for i in range(0,n_patches,bs):
+            batch  = patches[i:i+bs,:,:,:]
+            batch = torch.from_numpy(batch).float().div(255)
+            batch = (batch  - 0.5) * 2
+            temp = self.network.get_prediction_tensor(batch)
+            out[i:i+bs,:,:,:] = temp['raw_out']
+
+        elapsed_time = time.time() - last
+        last = time.time()
+        print('patches 2 prediction: %0.4f'%(elapsed_time))
+        out = np.reshape(out,outshape)
+        out = np.reshape(out,(orishape[0],orishape[1],outshape[3],outshape[1],outshape[2]))
+
+        outpng = patches2png_legacy(out,w,h,opt.step,opt.size)
+        print('merging')
+        outpng = np.transpose(outpng,(1,2,0))
+        outpng = np.squeeze(outpng) 
+        outpng = (outpng + 1)/2
+        out = outpng
+        outpng = outpng*255
+        if ow!=w or oh!=h:
+            outpng = outpng[:ow,:oh]
+        return outpng
+    
+    def dir_png_predict(self,fold):
+        self.input = fold
+        imlist =[]
+        imnamelist =[]
+        for root,_,fnames in sorted(os.walk(fold)):
+            for fname in fnames:
+                if fname.endswith('.png') and 'M1BS' in fname and not fname.startswith('.'):
+                    path = os.path.join(root,fname)
+                    imlist.append((path,fname))
+                    imnamelist.append(fname)
+        imlist.sort()
+        for path,name in imlist :
+            try:
+                print(path)
+                inpng = misc.imread(path)
+                outpng = self.png_predict(inpng)
+                out_vis = show_plainmask_on_image(inpng,outpng)
+                misc.imsave(self.output+'/raw/'+name,outpng)
+                misc.imsave(self.output+'/vis/'+name,out_vis)
+            except:
+                print('cant handle ' + name)
+    def eval_dir_J(self,GT):
+        imlist =[]
+        imnamelist =[]
+        for root,_,fnames in sorted(os.walk(self.out_raw)):
+            for fname in fnames:
+                if fname.endswith('.png') and 'M1BS' in fname and not fname.startswith('.'):
+                    path = os.path.join(root,fname)
+                    imlist.append((path,fname))
+                    imnamelist.append(fname)
+        imlist.sort()
+        imlist= []
+        f = open('test_list.txt','r')
+        for line in f:
+            imlist.append(line.strip().replace('.tif','.png').replace('[','[').replace(']',']').replace('_Annotated',''))
+            #imlist.append(my_escape(line.strip().replace('.tif','.png').replace('_Annotated','')))
+
+        print(imlist)
+        with open(os.path.join(self.out_raw+'/iou.txt'),'w') as FILE:
+            iou_all =[]
+            for name in imlist:
+                preds = misc.imread(os.path.join(self.out_raw,name))
+#                preds = (preds>150)
+                preds = (preds>40)
+                labs = misc.imread(os.path.join(GT,name))
+                labs = (labs >0.5)
+                misc.imsave(self.output+'/tmp/'+name,preds.astype(np.uint8)*255)
+                target= labs.flatten()
+                prediction = preds.flatten()
+                intersection = np.logical_and(target, prediction)
+                union = np.logical_or(target, prediction)
+                iou = np.sum(intersection.astype(np.float)) / np.sum(union.astype(np.float))
+                print(name,iou)
+                iou_all.append(iou)
+                FILE.write('%s %02.2f   \n'%(name,iou))
+            m_iou = sum(iou_all)/len(iou_all)
+            print("Mean IOU: %f"%m_iou)
+            FILE.write(' %02.2f  \n'%(m_iou))
+            FILE.close()
+
+    def eval_dir_AP(self,GT):
+        imlist =[]
+        imnamelist =[]
+        for root,_,fnames in sorted(os.walk(self.out_raw)):
+            for fname in fnames:
+                if fname.endswith('.png') and 'M1BS' in fname and not fname.startswith('.'):
+                    path = os.path.join(root,fname)
+                    imlist.append((path,fname))
+                    imnamelist.append(fname)
+        #imlist.sort()
+        imlist=[] 
+        f = open('test_list.txt','r')
+        for line in f:
+            imlist.append(line.strip().replace('.tif','.png').replace('[','[').replace(']',']').replace('_Annotated',''))
+
+
+        with open(os.path.join(self.out_raw+'/Prec_recall.txt'),'w') as FILE:
+            FILE.write(' NAME  True_Positive False_Negative False_Positive True_Negative  \n')
+            for  name in imlist:
+                preds = misc.imread(os.path.join(self.out_raw,name))
+                labs = misc.imread(os.path.join(GT,name))
+                labs = (labs == np.amax(labs)).astype(np.float)
+                
+                preds = preds.astype(np.uint8)
+                #AP = ap_score(labs.flatten(),preds.flatten())
+                preds = (preds>=(40)).astype(np.float)
+
+                
+                tp = np.sum(preds[labs==1] == 1).astype(np.float)
+                fn = np.sum(preds[labs==1] == 0).astype(np.float)
+                fp = np.sum(preds[labs==0] == 1).astype(np.float)
+                tn = np.sum(preds[labs==0] ==0).astype(np.float)
+
+                #print(tp,fn,fp,tn)
+                conf_matrix = [tp/(tp+fn),fp/(tp+fp),fn/(fn+tn),tn/(tn+fn)]
+                Prec = tp/(tp+fp)
+                Recall = tp/(tp+fn)
+            
+                FILE.write(' %s  %02.2f    %02.2f     %02.2f   %02.2f \n'%(name, tp,fn,fp,tn))
+            FILE.close()
+
+    def subset_prior(self):
+        self.dir_png_predict_with_prior('/nfs/bigbox/hieule/GAN/data/Penguins/WL_Train/merged/A',
+                '/nfs/bigbox/hieule/GAN/data/Penguins/WL_Train/merged/B',
+                names=["arthurson","adare","hopebay2006","paulet","crozier","colbeckarch","comb","duke","gibbney","hallett","heroina","hopebay2011","inexpressible","sims","mtriiserlarsen","vortex","ambush","beagle","beaufort","beaufortnorth","blownbluff","capebatterbee","coulmannorth","franklin_pansh","hero2","royds","ufs"])
+    def testset2_prior(self):
+        self.dir_png_predict_with_prior('/nfs/bigbox/hieule/GAN/data/Penguins/WL_Train/merged/A','/nfs/bigbox/hieule/GAN/data/Penguins/WL_Train/merged/B')
+    def RStestset_prior(self):
+        self.dir_png_predict_with_prior('/nfs/bigbox/hieule/penguin_data/RemoteSensing/A','/nfs/bigbox/hieule/penguin_data/RemoteSensing/C')
+        self.eval_dir_J('/nfs/bigbox/hieule/penguin_data/RemoteSensing/B')
+        self.eval_dir_AP('/nfs/bigbox/hieule/penguin_data/RemoteSensing/B')
+
+    def RStestset(self):
+        self.dir_png_predict('/nfs/bigbox/hieule/penguin_data/RemoteSensing/A')
+        self.eval_dir_J('/nfs/bigbox/hieule/penguin_data/RemoteSensing/B')
+    def testset1_prior(self):
+        self.dir_png_predict_with_prior('/nfs/bigbox/hieule/GAN/data/Penguins/Test_100/A','/nfs/bigbox/hieule/GAN/data/Penguins/Test_100/B')
+    def testset2(self):
+        self.dir_png_predict('/nfs/bigbox/hieule/GAN/data/Penguins/WL_Train/merged/A')
+    def testset1(self):
+        self.dir_png_predict('/nfs/bigbox/hieule/GAN/data/Penguins/Test_100/A')
+#        self.eval_dir_J('/nfs/bigbox/hieule/GAN/data/Penguins/Test/B')
+    def test_single_png(self,impath):
+        name = os.path.basename(impath)
+        inpng = misc.imread(impath)
+        outpng = self.png_predict(inpng)
+        out_vis = show_plainmask_on_image(inpng,outpng)
+        misc.imsave(self.output+'/raw/'+name,outpng)
+        misc.imsave(self.output+'/vis/'+name,out_vis)
+if __name__=='__main__':
+    opt = TestOptions().parse()
+    opt.testset = 'RemoteSensing'
+    opt.output='/nfs/bigbox/hieule/penguin_data/RemoteSensing/Results/'
+    a = Pipe(opt)
+    #a.test_single_png(opt.input_im)
+    #a.testset1_prior()
+    a.RStestset_prior()
+#    a.RStestset()
